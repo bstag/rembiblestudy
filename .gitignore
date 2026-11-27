@@ -1,0 +1,13 @@
+/target/
+/releases/
+.env
+.env.*
+api-key
+api-key.txt
+*.pem
+*.key
+*.pfx
+id_rsa*
+id_ed25519*
+*.rmdoc
+*.log

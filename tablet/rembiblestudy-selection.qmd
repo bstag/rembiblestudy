@@ -1,0 +1,1005 @@
+VERSION 3.29.1.0
+
+AFFECT /qml/common/SceneSelectionHandler.qml
+    TRAVERSE Item > SelectionContextualMenu#tools
+        LOCATE BEFORE ArkControls.ContextualMenu.Button#convertToText
+        INSERT {
+        ArkControls.ContextualMenu.Button {
+            id: bibleStudyLookup
+            objectName: "bibleStudyLookup"
+            focusPolicy: Qt.NoFocus
+            visible: controller && (typeof controller.selectionContainsStroke === "undefined"
+                                    || controller.selectionContainsStroke)
+            type: tools.type
+            iconSource: "qrc:/ark/icons/search"
+
+            onClicked: {
+                if (!controller || bibleStudyDialog.busy) {
+                    return;
+                }
+                var scale = typeof sceneView !== "undefined" && sceneView && sceneView.defaultScale > 0
+                            ? sceneView.defaultScale : 1;
+                var strokes = controller.cloneSelectedItems(controller.currentLayer, scale);
+                bibleStudyDialog.beginRecognition(strokes, selectionRoot);
+            }
+        }
+        }
+    END TRAVERSE
+
+END AFFECT
+
+AFFECT /qml/device/view/documentview/DocumentView.qml
+    IMPORT net.asivery.CommandExecutor 1.0
+
+    TRAVERSE FocusScope#root
+        LOCATE BEFORE DocumentToolSettings#documentViewTools
+        INSERT {
+        Rectangle {
+            id: bibleStudyDialog
+            z: 300
+            visible: false
+            anchors.top: parent.top
+            anchors.topMargin: Math.min(140, parent.height * 0.07)
+            anchors.horizontalCenter: parent.horizontalCenter
+            width: Math.min(820, parent.width - 96)
+            height: bibleStudyPanel.implicitHeight + 48
+            color: "white"
+            border.color: "black"
+            border.width: 3
+            radius: 10
+
+            property bool recognizing: false
+            property bool lookingUp: false
+            property bool editing: false
+            property var placement: null
+            readonly property bool busy: recognizing || lookingUp || bibleStudyCommand.running
+            property var previousJob: null
+            property int recognitionTicks: 0
+            property string statusMessage: ""
+            property string passageReference: ""
+            property string passageContent: ""
+            property string copyrightNotice: ""
+            property string commandOutput: ""
+            property string lookupMode: "passage"
+            property var quoteMatches: []
+            property string inkHeading: ""
+
+            Component.onCompleted: {
+                var top = parent;
+                while (top && top.parent) {
+                    top = top.parent;
+                }
+                if (top) {
+                    parent = top;
+                }
+            }
+
+            MouseArea { anchors.fill: parent }
+
+            Connections {
+                target: root
+                function onDocumentChanged() { bibleStudyDialog.close(); }
+                function onCurrentPageChanged() { bibleStudyDialog.close(); }
+                function onVisibleChanged() {
+                    if (!root.visible) {
+                        bibleStudyDialog.close();
+                    }
+                }
+            }
+
+            function beginEditing() {
+                if (busy) {
+                    return;
+                }
+                bibleStudyReference.cursorPosition = bibleStudyReference.length;
+                bibleStudyReference.forceActiveFocus();
+                editing = true;
+                Qt.inputMethod.show();
+            }
+
+            function endEditing() {
+                if (editing) {
+                    editing = false;
+                    Qt.inputMethod.hide();
+                    bibleStudyReference.focus = false;
+                }
+            }
+
+            function close() {
+                endEditing();
+                visible = false;
+                recognizing = false;
+                previousJob = null;
+                placement = null;
+                if (lookingUp) {
+                    lookingUp = false;
+                    if (bibleStudyCommand.running) {
+                        bibleStudyCommand.terminateCommand(100);
+                    }
+                }
+            }
+
+            function beginRecognition(strokes, handler) {
+                endEditing();
+                placement = capturePlacement(handler);
+                lookupMode = "passage";
+                bibleStudyReference.text = "";
+                clearPassage();
+                statusMessage = "Reading handwriting…";
+                previousJob = Recognizer.selectionToolJob;
+                recognitionTicks = 0;
+                recognizing = true;
+                visible = true;
+                Recognizer.startSelectionToolJob(strokes, Settings.handwritingConversionLanguage);
+            }
+
+            function clearPassage() {
+                passageReference = "";
+                passageContent = "";
+                copyrightNotice = "";
+                quoteMatches = [];
+                inkHeading = "";
+            }
+
+            function finishRecognition(message) {
+                recognizing = false;
+                previousJob = null;
+                statusMessage = message;
+            }
+
+            function checkRecognition() {
+                if (!recognizing) {
+                    return;
+                }
+                var job = Recognizer.selectionToolJob;
+                if (!job || job === previousJob) {
+                    if (recognitionTicks >= 15) {
+                        finishRecognition("Handwriting conversion could not start. Enter the reference below.");
+                    }
+                    return;
+                }
+                if (job.error !== undefined && job.error !== RecognitionJob.ConvertError.NoError) {
+                    finishRecognition("Could not read the selection. Check Wi-Fi and sign-in, or enter the reference below.");
+                } else if (job.status === RecognitionJob.Status.Done) {
+                    var text = (job.plainText || "").trim();
+                    finishRecognition(text ? "" : "No handwriting recognized. Enter the reference below.");
+                    if (text) {
+                        bibleStudyReference.text = text.replace(/\s+/g, " ");
+                        if (/\d+\s*:\s*\d+/.test(bibleStudyReference.text)) {
+                            lookUp("passage");
+                        } else {
+                            lookupMode = "quote";
+                        }
+                    }
+                } else if (recognitionTicks >= 50) {
+                    finishRecognition("Handwriting conversion timed out. Enter the reference below.");
+                }
+            }
+
+            function lookUp(mode) {
+                var reference = bibleStudyReference.text.trim();
+                if (busy || !reference) {
+                    return;
+                }
+                endEditing();
+                clearPassage();
+                lookupMode = mode;
+                statusMessage = mode === "quote" ? "Finding matches…" : "Looking up Scripture…";
+                commandOutput = "";
+                lookingUp = true;
+                bibleStudyCommand.arguments = [mode === "quote" ? "tablet-quote" : "tablet-lookup", reference];
+                if (bibleStudyCommand.startCommand(1000)) {
+                    bibleStudyRequestTimeout.restart();
+                } else {
+                    lookingUp = false;
+                    statusMessage = "Could not start Bible Study on this tablet.";
+                }
+            }
+
+            function finishLookup() {
+                bibleStudyRequestTimeout.stop();
+                if (!lookingUp) {
+                    return;
+                }
+                lookingUp = false;
+                var result;
+                try {
+                    result = JSON.parse(commandOutput);
+                } catch (err) {
+                    statusMessage = "Bible Study returned an invalid result.";
+                    return;
+                }
+                if (result && typeof result.error === "string") {
+                    statusMessage = result.error;
+                    return;
+                }
+                if (lookupMode === "quote" && result && Array.isArray(result.matches)) {
+                    quoteMatches = result.matches;
+                    statusMessage = quoteMatches.length ? "Choose a match to review it."
+                                                       : "No matches. Try different words or keep it as heard.";
+                    if (Array.isArray(result.warnings) && result.warnings.length) {
+                        statusMessage += " " + result.warnings.join(" ");
+                    }
+                    bibleStudyScroll.contentY = 0;
+                    return;
+                }
+                if (!result || typeof result.reference !== "string" || typeof result.content !== "string"
+                    || typeof result.copyright !== "string") {
+                    statusMessage = "Bible Study returned an invalid result.";
+                    return;
+                }
+                statusMessage = "";
+                passageReference = result.reference;
+                passageContent = result.content;
+                copyrightNotice = result.copyright;
+                bibleStudyScroll.contentY = 0;
+            }
+
+            function chooseQuote(match) {
+                clearPassage();
+                passageReference = match.reference;
+                passageContent = match.content;
+                copyrightNotice = match.source + (match.url ? "\n" + match.url : "");
+                inkHeading = match.heading;
+                statusMessage = "";
+                bibleStudyScroll.contentY = 0;
+            }
+
+            function keepAsHeard() {
+                var captured = bibleStudyReference.text.trim();
+                if (busy || !captured) {
+                    return;
+                }
+                endEditing();
+                clearPassage();
+                passageReference = "As heard";
+                passageContent = captured;
+                copyrightNotice = "Wording and attribution unverified.";
+                inkHeading = "As heard";
+                statusMessage = "";
+                bibleStudyScroll.contentY = 0;
+            }
+
+            function canInsertInk() {
+                return sceneView.notePage && passageContent.length > 0;
+            }
+
+            function capturePlacement(handler) {
+                var surface = parent;
+                if (!surface || surface.width <= 0 || surface.height <= 0
+                    || Math.abs(surface.width / surface.height - 0.75) > 0.04 || !sceneView.tileManager) {
+                    return null;
+                }
+                var selected = handler.viewSelectionRect;
+                var available = handler.availableSceneRect;
+                if (selected.width <= 0 || selected.height <= 0) {
+                    return null;
+                }
+                var start = handler.mapToItem(surface, selected.x, selected.y + selected.height);
+                var origin = handler.mapToItem(surface, available.x, available.y);
+                var edge = handler.mapToItem(surface, available.x + available.width,
+                                             available.y + available.height);
+                var sx = 1620 / surface.width;
+                var sy = 2160 / surface.height;
+                var left = Math.max(0, origin.x * sx) + 48;
+                var right = Math.min(1620, edge.x * sx) - 55;
+                return {
+                    page: handler.page,
+                    controller: handler.controller,
+                    layer: handler.controller.currentLayer,
+                    geometry: bibleStudyInkWriter.geometry(),
+                    available: [Math.round(left), Math.round(Math.max(0, origin.y * sy) + 24),
+                                Math.round(right), Math.round(Math.min(2160, edge.y * sy) - 54)],
+                    bounds: [Math.round(Math.max(left, Math.min(start.x * sx, right - 920))),
+                             Math.round(start.y * sy + 36),
+                             Math.round(right),
+                             Math.round(Math.min(2160, edge.y * sy) - 54)]
+                };
+            }
+
+            function insertInk() {
+                if (!placement || !sceneView.tileManager || placement.controller !== sceneView.controller
+                    || placement.layer !== sceneView.controller.currentLayer
+                    || placement.geometry !== bibleStudyInkWriter.geometry()) {
+                    statusMessage = "Select the reference again on the upright notebook page to place the ink.";
+                    return;
+                }
+                endEditing();
+                visible = false;
+                bibleStudyPlacement.openFor(placement, passageReference, passageContent, inkHeading);
+            }
+
+            Timer {
+                interval: 400
+                running: bibleStudyDialog.recognizing
+                repeat: true
+                onTriggered: {
+                    bibleStudyDialog.recognitionTicks += 1;
+                    bibleStudyDialog.checkRecognition();
+                }
+            }
+
+            Timer {
+                id: bibleStudyRequestTimeout
+                interval: 15000
+                onTriggered: {
+                    if (bibleStudyDialog.lookingUp) {
+                        bibleStudyDialog.lookingUp = false;
+                        bibleStudyDialog.statusMessage = "Lookup timed out. Check Wi-Fi and try again.";
+                        bibleStudyCommand.terminateCommand(100);
+                    }
+                }
+            }
+
+            AsyncCommandExecutor {
+                id: bibleStudyCommand
+                command: "/home/root/xovi/exthome/rembiblestudy/entry"
+                onStdOutAvailable: function (output) { bibleStudyDialog.commandOutput += output; }
+                onRunningChanged: {
+                    if (!running) {
+                        bibleStudyDialog.finishLookup();
+                    }
+                }
+            }
+
+            Column {
+                id: bibleStudyPanel
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.top: parent.top
+                anchors.margins: 24
+                spacing: 14
+
+                Text {
+                    text: "Bible Study"
+                    font.bold: true
+                    font.pixelSize: 34
+                }
+
+                Text {
+                    width: parent.width
+                    text: "Look up a reference, or find a quote by phrase or Author — words."
+                    wrapMode: Text.WordWrap
+                    font.pixelSize: 24
+                }
+
+                Rectangle {
+                    width: parent.width
+                    height: 68
+                    color: "white"
+                    border.color: "black"
+                    border.width: bibleStudyReference.activeFocus ? 4 : 2
+                    radius: 6
+
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: bibleStudyDialog.beginEditing()
+                    }
+
+                    TextInput {
+                        id: bibleStudyReference
+                        anchors.fill: parent
+                        anchors.margins: 12
+                        verticalAlignment: TextInput.AlignVCenter
+                        color: "black"
+                        clip: true
+                        readOnly: bibleStudyDialog.busy
+                        activeFocusOnPress: true
+                        selectByMouse: true
+                        maximumLength: 200
+                        font.pixelSize: 28
+                        onActiveFocusChanged: {
+                            if (activeFocus && !readOnly) {
+                                bibleStudyDialog.editing = true;
+                                Qt.inputMethod.show();
+                            }
+                        }
+                        onTextEdited: {
+                            bibleStudyDialog.clearPassage();
+                            bibleStudyDialog.statusMessage = "";
+                        }
+                        onAccepted: bibleStudyDialog.lookUp(bibleStudyDialog.lookupMode)
+                    }
+                }
+
+                Row {
+                    width: parent.width
+                    height: 68
+                    spacing: 12
+
+                    Button {
+                        width: (parent.width - parent.spacing * 3) / 4
+                        height: parent.height
+                        text: "Close"
+                        font.pixelSize: 24
+                        onClicked: bibleStudyDialog.close()
+                    }
+                    Button {
+                        width: (parent.width - parent.spacing * 3) / 4
+                        height: parent.height
+                        text: "Look up"
+                        font.pixelSize: 24
+                        enabled: !bibleStudyDialog.busy && bibleStudyReference.text.trim().length > 0
+                        onClicked: bibleStudyDialog.lookUp("passage")
+                    }
+                    Button {
+                        width: (parent.width - parent.spacing * 3) / 4
+                        height: parent.height
+                        text: "Find quote"
+                        font.pixelSize: 24
+                        enabled: !bibleStudyDialog.busy && bibleStudyReference.text.trim().length > 0
+                        onClicked: bibleStudyDialog.lookUp("quote")
+                    }
+                    Button {
+                        width: (parent.width - parent.spacing * 3) / 4
+                        height: parent.height
+                        text: "As heard"
+                        font.pixelSize: 24
+                        enabled: !bibleStudyDialog.busy && bibleStudyReference.text.trim().length > 0
+                        onClicked: bibleStudyDialog.keepAsHeard()
+                    }
+                }
+
+                Button {
+                    text: "Insert as ink"
+                    font.pixelSize: 27
+                    visible: bibleStudyDialog.canInsertInk()
+                    enabled: bibleStudyDialog.busy === false
+                    onClicked: bibleStudyDialog.insertInk()
+                }
+
+                Text {
+                    visible: bibleStudyDialog.canInsertInk()
+                    width: parent.width
+                    text: "Leave blank space below the reference. Ink uses your primary pen."
+                    wrapMode: Text.WordWrap
+                    font.pixelSize: 21
+                }
+
+                Text {
+                    width: parent.width
+                    visible: bibleStudyDialog.statusMessage.length > 0
+                    text: bibleStudyDialog.statusMessage
+                    textFormat: Text.PlainText
+                    wrapMode: Text.WordWrap
+                    font.pixelSize: 26
+                }
+
+                Flickable {
+                    id: bibleStudyScroll
+                    width: parent.width
+                    height: visible ? Math.min(bibleStudyPassage.implicitHeight,
+                                               bibleStudyDialog.parent.height * 0.40) : 0
+                    visible: bibleStudyDialog.passageContent.length > 0 || bibleStudyDialog.quoteMatches.length > 0
+                    clip: true
+                    contentWidth: width
+                    contentHeight: bibleStudyPassage.implicitHeight
+
+                    Column {
+                        id: bibleStudyPassage
+                        width: bibleStudyScroll.width
+                        spacing: 12
+
+                        Repeater {
+                            model: bibleStudyDialog.quoteMatches
+                            Rectangle {
+                                width: bibleStudyPassage.width
+                                height: quoteSummary.implicitHeight + 24
+                                color: "white"
+                                border.color: "black"
+                                radius: 5
+                                Text {
+                                    id: quoteSummary
+                                    anchors.left: parent.left
+                                    anchors.right: parent.right
+                                    anchors.top: parent.top
+                                    anchors.margins: 12
+                                    text: modelData.reference + "\n" + modelData.content
+                                    textFormat: Text.PlainText
+                                    maximumLineCount: 4
+                                    elide: Text.ElideRight
+                                    wrapMode: Text.WordWrap
+                                    font.pixelSize: 24
+                                }
+                                MouseArea {
+                                    anchors.fill: parent
+                                    onClicked: bibleStudyDialog.chooseQuote(modelData)
+                                }
+                            }
+                        }
+
+                        Text {
+                            width: parent.width
+                            visible: bibleStudyDialog.passageReference.length > 0
+                            text: bibleStudyDialog.passageReference
+                            textFormat: Text.PlainText
+                            wrapMode: Text.WordWrap
+                            font.bold: true
+                            font.pixelSize: 32
+                        }
+
+                        Text {
+                            width: parent.width
+                            visible: bibleStudyDialog.passageContent.length > 0
+                            text: bibleStudyDialog.passageContent
+                            textFormat: Text.PlainText
+                            wrapMode: Text.WordWrap
+                            font.pixelSize: 29
+                        }
+
+                        Text {
+                            width: parent.width
+                            visible: bibleStudyDialog.copyrightNotice.length > 0
+                            text: bibleStudyDialog.copyrightNotice
+                            textFormat: Text.PlainText
+                            wrapMode: Text.WordWrap
+                            font.pixelSize: 21
+                        }
+                    }
+                }
+            }
+        }
+
+        Item {
+            id: bibleStudyPlacement
+            anchors.fill: parent
+            z: 320
+            visible: false
+
+            property var original: null
+            property var request: null
+            property var footprint: null
+            property string output: ""
+            property string hint: ""
+            property bool canWrite: false
+
+            Component.onCompleted: {
+                var host = parent;
+                while (host && host.parent) {
+                    host = host.parent;
+                }
+                if (host) {
+                    parent = host;
+                }
+            }
+
+            function samePage() {
+                return original && root.visible && sceneView.notePage && sceneView.tileManager
+                       && sceneView.page === original.page && sceneView.controller === original.controller
+                       && sceneView.controller.currentLayer === original.layer
+                       && bibleStudyInkWriter.geometry() === original.geometry;
+            }
+
+            function openFor(placement, reference, content, heading) {
+                original = placement;
+                request = { reference: reference, content: content, bounds: placement.bounds };
+                if (heading) {
+                    request.heading = heading;
+                }
+                visible = true;
+                check();
+            }
+
+            function moveTo(x, y) {
+                if (!samePage()) {
+                    cancel();
+                    return;
+                }
+                var area = original.available;
+                var left = Math.round(x * 1620 / width);
+                var top = Math.round(y * 2160 / height);
+                left = Math.max(area[0], Math.min(left, area[2] - 280));
+                top = Math.max(area[1], top);
+                request.bounds = [left, top, area[2], area[3]];
+                check();
+            }
+
+            function check() {
+                if (!visible || bibleStudyPlacementCommand.running) {
+                    return;
+                }
+                canWrite = false;
+                footprint = null;
+                output = "";
+                hint = "Checking the passage area…";
+                bibleStudyPlacementCommand.arguments = ["tablet-ink-check", JSON.stringify(request)];
+                if (!bibleStudyPlacementCommand.startCommand(1000)) {
+                    hint = "Could not check the passage area.";
+                } else {
+                    bibleStudyPlacementTimeout.restart();
+                }
+            }
+
+            function finishCheck() {
+                bibleStudyPlacementTimeout.stop();
+                if (!visible) {
+                    return;
+                }
+                if (!samePage()) {
+                    hint = "The page moved. Tap Cancel and select the reference again.";
+                    return;
+                }
+                var result;
+                try {
+                    result = JSON.parse(output);
+                } catch (err) {
+                    hint = "Could not check the passage area.";
+                    return;
+                }
+                if (!result || !result.bounds) {
+                    hint = ((result && result.error) || "Could not fit the passage.")
+                           + " Tap a different spot.";
+                    return;
+                }
+                footprint = result.bounds;
+                updateAvailability();
+            }
+
+            function overlaps(a, b) {
+                return b && b.width > 0 && b.height > 0
+                       && a.x < b.x + b.width && a.x + a.width > b.x
+                       && a.y < b.y + b.height && a.y + a.height > b.y;
+            }
+
+            function occupancy() {
+                try {
+                    const near = sceneView.mapFromItem(bibleStudyPlacement,
+                                                       (footprint[0] - 8) * width / 1620,
+                                                       (footprint[1] - 8) * height / 2160);
+                    const far = sceneView.mapFromItem(bibleStudyPlacement,
+                                                      (footprint[2] + 8) * width / 1620,
+                                                      (footprint[3] + 8) * height / 2160);
+                    const region = sceneView.tileManager.viewToScene(
+                        Qt.rect(near.x, near.y, far.x - near.x, far.y - near.y));
+                    if (!region || !(region.width > 0 && region.height > 0)) {
+                        return "unknown";
+                    }
+                    const controller = sceneView.controller;
+                    if (controller.isRootDocumentVisible && controller.rootDocumentLength > 0
+                        && overlaps(region, controller.rootDocumentBoundingRect)) {
+                        return "occupied";
+                    }
+                    if (typeof controller.getLineBoundingRectsToBeSelected !== "function") {
+                        return "unknown";
+                    }
+                    const left = Math.floor(region.x);
+                    const top = Math.floor(region.y);
+                    const bounds = Qt.rect(left, top, Math.ceil(region.x + region.width) - left,
+                                           Math.ceil(region.y + region.height) - top);
+                    const lines = controller.getLineBoundingRectsToBeSelected(bounds);
+                    if (!lines || typeof lines.length !== "number") {
+                        return "unknown";
+                    }
+                    for (var i = 0; i < lines.length; i++) {
+                        if (overlaps(bounds, lines[i])) {
+                            return "occupied";
+                        }
+                    }
+                    return overlaps(bounds, controller.itemsBoundingRect) ? "unknown" : "clear";
+                } catch (err) {
+                    return "unknown";
+                }
+            }
+
+            function updateAvailability() {
+                const state = occupancy();
+                canWrite = state !== "occupied";
+                if (state === "occupied") {
+                    hint = "There is ink or text in the outlined area. Tap a blank spot.";
+                } else if (state === "unknown") {
+                    hint = "Check that the outlined area is blank. Tap the page to move it.";
+                } else {
+                    hint = "The outlined area is clear. Tap the page to move it or write here.";
+                }
+            }
+
+            function cancel() {
+                if (!visible) {
+                    return;
+                }
+                visible = false;
+                if (bibleStudyPlacementCommand.running) {
+                    bibleStudyPlacementCommand.terminateCommand(100);
+                }
+                if (samePage()) {
+                    bibleStudyDialog.visible = true;
+                }
+            }
+
+            function confirm() {
+                if (!footprint || !samePage()) {
+                    return;
+                }
+                updateAvailability();
+                if (!canWrite) {
+                    return;
+                }
+                if (bibleStudyInkWriter.queue(request, original.page, original.controller)) {
+                    visible = false;
+                    bibleStudyDialog.close();
+                } else {
+                    hint = bibleStudyInkWriter.message;
+                }
+            }
+
+            Connections {
+                target: root
+                function onCurrentPageChanged() { bibleStudyPlacement.cancel(); }
+                function onDocumentChanged() { bibleStudyPlacement.cancel(); }
+            }
+
+            Timer {
+                id: bibleStudyPlacementTimeout
+                interval: 3000
+                onTriggered: {
+                    bibleStudyPlacementCommand.terminateCommand(100);
+                    bibleStudyPlacement.hint = "The placement check timed out. Tap a spot to retry.";
+                }
+            }
+
+            AsyncCommandExecutor {
+                id: bibleStudyPlacementCommand
+                command: "/home/root/xovi/exthome/rembiblestudy/entry"
+                onStdOutAvailable: function (data) { bibleStudyPlacement.output += data; }
+                onRunningChanged: {
+                    if (!running) {
+                        bibleStudyPlacement.finishCheck();
+                    }
+                }
+            }
+
+            MouseArea {
+                anchors.fill: parent
+                preventStealing: true
+                onClicked: function(mouse) {
+                    if (!bibleStudyPlacementCommand.running) {
+                        bibleStudyPlacement.moveTo(mouse.x, mouse.y);
+                    }
+                }
+            }
+
+            Rectangle {
+                readonly property var area: bibleStudyPlacement.footprint
+                visible: area !== null
+                x: area ? area[0] * parent.width / 1620 - 5 : 0
+                y: area ? area[1] * parent.height / 2160 - 5 : 0
+                width: area ? (area[2] - area[0]) * parent.width / 1620 + 10 : 0
+                height: area ? (area[3] - area[1]) * parent.height / 2160 + 10 : 0
+                color: "transparent"
+                border.color: "black"
+                border.width: 3
+            }
+
+            Rectangle {
+                anchors.horizontalCenter: parent.horizontalCenter
+                y: bibleStudyPlacement.footprint && bibleStudyPlacement.footprint[1] * parent.height / 2160 < 174
+                   ? parent.height - height - 16 : 16
+                width: Math.min(parent.width - 100, 940)
+                height: 142
+                color: "white"
+                border.color: "black"
+                border.width: 3
+                radius: 8
+
+                MouseArea { anchors.fill: parent }
+
+                Column {
+                    z: 1
+                    anchors.fill: parent
+                    anchors.margins: 12
+                    spacing: 8
+
+                    Text {
+                        width: parent.width
+                        height: 52
+                        text: bibleStudyPlacement.hint
+                        wrapMode: Text.WordWrap
+                        font.pixelSize: 23
+                    }
+
+                    Row {
+                        spacing: 12
+                        Button {
+                            width: 150
+                            height: 56
+                            font.pixelSize: 26
+                            text: "Cancel"
+                            onClicked: bibleStudyPlacement.cancel()
+                        }
+                        Button {
+                            width: 190
+                            height: 56
+                            font.pixelSize: 26
+                            objectName: "bibleStudyWriteHere"
+                            text: "Write here"
+                            enabled: bibleStudyPlacement.canWrite
+                            onClicked: bibleStudyPlacement.confirm()
+                        }
+                    }
+                }
+            }
+        }
+
+        Rectangle {
+            id: bibleStudyInkWriter
+            z: 1000
+            anchors.top: parent.top
+            anchors.topMargin: 32
+            anchors.horizontalCenter: parent.horizontalCenter
+            width: Math.min(parent.width - 120, bibleStudyInkLabel.implicitWidth + 48)
+            height: bibleStudyInkLabel.height + 28
+            visible: message.length > 0
+            color: "white"
+            border.color: "black"
+            border.width: 2
+            radius: 6
+
+            property string message: ""
+            property string output: ""
+            property string pending: ""
+            property var expectedDocument: null
+            property var expectedController: null
+            property int expectedLayer: -1
+            property int expectedPage: -1
+            property string expectedGeometry: ""
+            property bool cancelling: false
+
+            function queue(request, page, controller) {
+                if (pending || bibleStudyInkCommand.running) {
+                    show("Bible Study is already writing ink.", false);
+                    return false;
+                }
+                if (!root.visible || !sceneView.notePage || sceneView.page !== page
+                    || sceneView.controller !== controller || !sceneView.tileManager) {
+                    show("Open the notebook page and select the reference again.", false);
+                    return false;
+                }
+                if (root.orientation.orientation !== WindowLayout.Orientation.Portrait) {
+                    show("Turn the notebook upright before inserting ink.", false);
+                    return false;
+                }
+                const tool = documentViewTools.primaryPen.tool;
+                if (!documentViewTools.isWritingTool(tool) || tool === Line.Highlighter) {
+                    show("Choose a writing pen as your primary tool first.", false);
+                    return false;
+                }
+                bibleStudyInkRefresh.stop();
+                expectedDocument = root.document;
+                expectedController = controller;
+                expectedLayer = controller.currentLayer;
+                expectedPage = page;
+                expectedGeometry = geometry();
+                pending = JSON.stringify(request);
+                cancelling = false;
+                show("Lift the marker. Writing Scripture shortly…", true);
+                bibleStudyInkDelay.restart();
+                return true;
+            }
+
+            function geometry() {
+                var origin = sceneView.tileManager.sceneToView(Qt.rect(0, 0, 10, 10));
+                return [origin.x, origin.y, origin.width, origin.height,
+                        sceneView.width, sceneView.height].join("/");
+            }
+
+            function stillOnPage() {
+                return root.visible && root.document === expectedDocument && sceneView.notePage
+                       && root.orientation.orientation === WindowLayout.Orientation.Portrait
+                       && sceneView.page === expectedPage && sceneView.controller === expectedController
+                       && sceneView.controller && sceneView.controller.currentLayer === expectedLayer
+                       && sceneView.tileManager && geometry() === expectedGeometry;
+            }
+
+            function begin() {
+                if (!stillOnPage()) {
+                    pending = "";
+                    show("The page moved. Select the reference again.", false);
+                    return;
+                }
+                documentViewTools.activeTool = "primary";
+                toolbar.selectPen("primary");
+                if (!stillOnPage() || documentViewTools.activeTool !== "primary") {
+                    pending = "";
+                    show("The page or pen changed. Select the reference again.", false);
+                    return;
+                }
+                show("Writing Scripture…", true);
+                output = "";
+                bibleStudyInkCommand.arguments = ["tablet-ink-write", pending];
+                if (!bibleStudyInkCommand.startCommand(1000)) {
+                    pending = "";
+                    show("Could not start ink insertion.", false);
+                }
+            }
+
+            function show(text, sticky) {
+                message = text;
+                bibleStudyInkStatusTimeout.stop();
+                if (!sticky) {
+                    bibleStudyInkStatusTimeout.restart();
+                }
+            }
+
+            function refreshInk() {
+                if (!stillOnPage() || !sceneView.viewport) {
+                    return;
+                }
+                const viewport = sceneView.viewport;
+                if (typeof viewport.markDirty === "function") {
+                    viewport.markDirty(Qt.rect(0, 0, viewport.width, viewport.height));
+                }
+                if (root.ghostBuster && typeof root.ghostBuster.forceClearNow === "function") {
+                    root.ghostBuster.forceClearNow("Scripture inserted");
+                } else if (typeof EPFramebuffer !== "undefined"
+                           && typeof EPFramebuffer.scheduleGhostRemoval === "function") {
+                    EPFramebuffer.scheduleGhostRemoval();
+                }
+                viewport.requestRepaintDirty();
+            }
+
+            Timer {
+                id: bibleStudyInkDelay
+                interval: 520
+                onTriggered: bibleStudyInkWriter.begin()
+            }
+            Timer {
+                id: bibleStudyInkStatusTimeout
+                interval: 3800
+                onTriggered: bibleStudyInkWriter.message = ""
+            }
+            Timer {
+                id: bibleStudyInkRefresh
+                interval: 450
+                onTriggered: bibleStudyInkWriter.refreshInk()
+            }
+            Timer {
+                interval: 80
+                repeat: true
+                running: bibleStudyInkCommand.running && !bibleStudyInkWriter.cancelling
+                onTriggered: {
+                    if (!bibleStudyInkWriter.stillOnPage() || documentViewTools.activeTool !== "primary") {
+                        bibleStudyInkWriter.cancelling = true;
+                        bibleStudyInkCommand.terminateCommand(250);
+                    }
+                }
+            }
+            AsyncCommandExecutor {
+                id: bibleStudyInkCommand
+                command: "/home/root/xovi/exthome/rembiblestudy/entry"
+                onStdOutAvailable: function (data) { bibleStudyInkWriter.output += data; }
+                onRunningChanged: {
+                    if (!running && bibleStudyInkWriter.pending) {
+                        bibleStudyInkWriter.pending = "";
+                        var result;
+                        try {
+                            result = JSON.parse(bibleStudyInkWriter.output);
+                        } catch (err) {
+                            result = {};
+                        }
+                        if (bibleStudyInkWriter.cancelling) {
+                            bibleStudyInkWriter.show("Ink stopped because the page or tool changed.", false);
+                        } else if (result.error) {
+                            bibleStudyInkWriter.show(result.error, false);
+                        } else if (result.strokes > 0) {
+                            bibleStudyInkWriter.show("", false);
+                            bibleStudyInkRefresh.restart();
+                        } else {
+                            bibleStudyInkWriter.show("Ink insertion did not finish.", false);
+                        }
+                    }
+                }
+            }
+            Text {
+                id: bibleStudyInkLabel
+                anchors.centerIn: parent
+                width: parent.width - 32
+                text: bibleStudyInkWriter.message
+                color: "black"
+                horizontalAlignment: Text.AlignHCenter
+                wrapMode: Text.WordWrap
+                font.pixelSize: 25
+            }
+        }
+        }
+    END TRAVERSE
+END AFFECT
